@@ -1,0 +1,11 @@
+{
+  "name": "codex-bridge-v2",
+  "version": "2.0.0",
+  "description": "Vollautomatischer Codex Workflow via GitHub - für alle Agents nutzbar",
+  "author": "Jarvis",
+  "commands": ["codex"],
+  "triggers": ["mit Codex", "/codex", "codex workflow", "codex send", "codex test"],
+  "script": "C:\\Users\\no\\Desktop\\codex_bridge_v2.py",
+  "default_repo": "SellTekk/Jarvis-Scripts",
+  "enabled": true
+}
