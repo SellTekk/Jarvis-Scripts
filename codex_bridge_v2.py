@@ -45,6 +45,7 @@ CONFIG = {
     'inbox_label': 'openclaw-task',
     'processed_label': 'codex-dispatched',
     'install_dir': str(Path.home() / '.codex_bridge'),
+    'skill_name': 'codex-bridge-auto',
 }
 
 
@@ -363,15 +364,56 @@ def install_bridge(repo=None):
     service = f"""[Unit]\nDescription=Codex Bridge Inbox Worker\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={install_dir}\nExecStart=/usr/bin/python3 {install_dir / 'codex_bridge_v2.py'} inbox {target_repo} --daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"""
     _write_text(str(install_dir / 'codex-bridge.service.example'), service)
 
+    codex_home = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+    skills_dir = codex_home / 'skills'
+    skill_dir = skills_dir / CONFIG['skill_name']
+    scripts_dir = skill_dir / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    skill_md = f"""---
+name: {CONFIG['skill_name']}
+description: Automatisiert OpenClaw->GitHub->Codex Aufgabenuebergabe. Nutze diese Skill fuer Installation, Start und Betrieb der Codex Bridge Inbox.
+---
+
+# Codex Bridge Auto Skill
+
+Diese Skill macht die Bridge fuer alle Agenten verfuetbar.
+
+## Wann nutzen
+- Wenn OpenClaw-Aufgaben per GitHub-Issue automatisch an Codex gehen sollen.
+- Wenn die Bridge auf einem neuen Host eingerichtet werden soll.
+
+## Standard-Workflow
+1) Installation ausfuehren:
+   `python3 {install_dir / 'codex_bridge_v2.py'} install {target_repo}`
+2) Token setzen (`GITHUB_TOKEN` oder `GH_TOKEN`).
+3) Dauerbetrieb starten:
+   `bash {install_dir / 'run_inbox.sh'}`
+
+## Aufgaben-Eingang
+- Neues GitHub-Issue mit Label `{CONFIG['inbox_label']}` anlegen.
+- Die Bridge erstellt Branch + Codex-Issue automatisch und kommentiert das Quell-Issue.
+"""
+    _write_text(str(skill_dir / 'SKILL.md'), skill_md)
+
+    start_script = f"""#!/usr/bin/env bash
+set -euo pipefail
+python3 "{install_dir / 'codex_bridge_v2.py'}" inbox "{target_repo}" --daemon
+"""
+    _write_text(str(scripts_dir / 'start-inbox.sh'), start_script)
+    os.chmod(scripts_dir / 'start-inbox.sh', 0o755)
+
     return {
         'status': 'installed',
         'install_dir': str(install_dir),
         'script': str(target_script),
+        'skill_dir': str(skill_dir),
         'repo': target_repo,
         'next_steps': [
             f'1) Token setzen: export GITHUB_TOKEN=... (oder in {install_dir}/.env)',
             f'2) Starten: {install_dir}/run_inbox.sh',
-            f'3) Aufgaben per GitHub-Issue mit Label "{CONFIG["inbox_label"]}" anlegen'
+            f'3) Aufgaben per GitHub-Issue mit Label "{CONFIG["inbox_label"]}" anlegen',
+            f'4) Skill fuer alle Agenten liegt unter: {skill_dir}'
         ]
     }
 
@@ -666,6 +708,7 @@ Automatisch:
   - Token wird aus GITHUB_TOKEN/GH_TOKEN, OpenClaw-Profil oder gh CLI geladen
   - Logs/Status werden unter ~/.codex_bridge gespeichert
   - Inbox-Modus: Label `openclaw-task` => automatische Uebergabe an Codex
+  - Bei `install`: Skill wird unter $CODEX_HOME/skills/codex-bridge-auto erzeugt
 
 Beispiele:
 
