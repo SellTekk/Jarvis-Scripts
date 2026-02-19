@@ -1,6 +1,6 @@
 # Codex Task
 
-OpenClaw Skill Format fix: Unsere SKILL.md hat keine YAML frontmatter. Laut Doku muss sie so starten: --- name: openclaw-codex-bridge description: ... --- Unsere SKILL.md startet direkt mit #. Ausserdem brauchen wir vielleicht einen Eintrag in openclaw.json unter skills.entries. Bitte analysieren und fixen.
+Test: Erstelle eine einfache Python-Hello-World-Funktion
 
-Branch: codex-1771519098
-Erstellt: 2026-02-19 17:38:22.484587
+Branch: codex-1771521108
+Erstellt: 2026-02-19 18:11:51.968748
