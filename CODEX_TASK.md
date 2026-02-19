@@ -1,6 +1,6 @@
 # Codex Task
 
-OpenClaw Skill wird nicht geladen - der Skill liegt in ~/.openclaw/skills/codex-bridge-v2/ mit SKILL.md und _meta.json aber openclaw skills list zeigt ihn nicht. Finde heraus warum und erstelle eine funktionierende Loesung
+OpenClaw Skill Format fix: Unsere SKILL.md hat keine YAML frontmatter. Laut Doku muss sie so starten: --- name: openclaw-codex-bridge description: ... --- Unsere SKILL.md startet direkt mit #. Ausserdem brauchen wir vielleicht einen Eintrag in openclaw.json unter skills.entries. Bitte analysieren und fixen.
 
-Branch: codex-1771516968
-Erstellt: 2026-02-19 17:02:52.356618
+Branch: codex-1771519098
+Erstellt: 2026-02-19 17:38:22.484587
