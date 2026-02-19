@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-codex-bridge",
+  "version": "1.0.0",
+  "displayName": "OpenClaw Codex Bridge",
+  "description": "Globaler Skill fuer OpenClaw Agents zur Bearbeitung von Codex-Bridge-Workflows",
+  "author": "Jarvis",
+  "triggers": [
+    "openclaw",
+    "codex bridge", 
+    "codex pr",
+    "skill",
+    "skill.md",
+    "skill-meta.json",
+    "trigger words",
+    "agent routing",
+    "bridge automation",
+    "github pr kommentar",
+    "follow-up actions",
+    "mit Codex",
+    "/codex"
+  ],
+  "script": "C:\\Users\\no\\Desktop\\codex_bridge_v2.py",
+  "default_repo": "SellTekk/Jarvis-Scripts",
+  "enabled": true,
+  "owner": "SellTekk",
+  "slug": "openclaw-codex-bridge"
+}
