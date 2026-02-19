@@ -23,7 +23,6 @@ import sys
 import json
 import base64
 import time
-import shutil
 import subprocess
 import requests
 from pathlib import Path
@@ -38,31 +37,106 @@ CONFIG = {
     'default_branch': 'main',
     'poll_interval': 30,
     'max_wait': 600,
-    'log_file': r'C:\Users\no\Desktop\codex_bridge_log.txt',
+    'log_file': str(Path.home() / '.codex_bridge' / 'codex_bridge.log'),
+    'status_file': str(Path.home() / '.codex_bridge' / 'codex_bridge_status.json'),
 }
+
+
+def _ensure_parent_dir(file_path):
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
 
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line)
     try:
+        _ensure_parent_dir(CONFIG['log_file'])
         with open(CONFIG['log_file'], 'a', encoding='utf-8') as f:
             f.write(line + '\n')
     except:
         pass
 
 def load_auth():
-    auth_file = r'C:\Users\no\.openclaw\agents\main\agent\auth-profiles.json'
+    # 1) Umgebungsvariablen bevorzugen (am stabilsten fuer Automatisierung)
+    env_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if env_token:
+        CONFIG['github_token'] = env_token
+        return True
+
+    # 2) OpenClaw auth profile (Windows + Linux + macOS Pfade)
+    auth_candidates = [
+        Path(r'C:\Users\no\.openclaw\agents\main\agent\auth-profiles.json'),
+        Path.home() / '.openclaw' / 'agents' / 'main' / 'agent' / 'auth-profiles.json'
+    ]
+
+    for auth_file in auth_candidates:
+        try:
+            with open(auth_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                token = data.get('profiles', {}).get('github:default', {}).get('key')
+                if token and 'DEIN_GITHUB' not in token:
+                    CONFIG['github_token'] = token
+                    return True
+        except:
+            pass
+
+    # 3) Fallback: gh CLI Token holen (wenn vorhanden)
     try:
-        with open(auth_file, 'r') as f:
-            data = json.load(f)
-            token = data.get('profiles', {}).get('github:default', {}).get('key')
-            if token and 'DEIN_GITHUB' not in token:
-                CONFIG['github_token'] = token
-                return True
+        token = subprocess.check_output(
+            ['gh', 'auth', 'token'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        ).strip()
+        if token:
+            CONFIG['github_token'] = token
+            return True
     except:
         pass
+
     return False
+
+def _read_file_content(file_path):
+    """Textinhalt robust einlesen. UTF-8 zuerst, dann Latin-1 Fallback."""
+    try:
+        return file_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            return file_path.read_text(encoding='latin-1')
+        except:
+            return None
+
+def _parse_wait_flag(args):
+    """Steuert workflow-Warteverhalten via --no-wait oder --wait=<sekunden>."""
+    wait = True
+    for arg in args:
+        if arg == '--no-wait':
+            wait = False
+        elif arg.startswith('--wait='):
+            try:
+                CONFIG['max_wait'] = int(arg.split('=', 1)[1])
+            except ValueError:
+                pass
+    return wait
+
+def _apply_runtime_config():
+    """Erlaubt automatische Konfiguration ohne Codeaenderung."""
+    poll = os.environ.get('CODEX_BRIDGE_POLL')
+    max_wait = os.environ.get('CODEX_BRIDGE_MAX_WAIT')
+    default_repo = os.environ.get('CODEX_BRIDGE_DEFAULT_REPO')
+
+    if poll and poll.isdigit():
+        CONFIG['poll_interval'] = int(poll)
+    if max_wait and max_wait.isdigit():
+        CONFIG['max_wait'] = int(max_wait)
+    if default_repo:
+        CONFIG['default_repo'] = default_repo
+
+    if not CONFIG.get('github_token'):
+        token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+        if token and 'DEIN_GITHUB' not in token:
+            CONFIG['github_token'] = token
+
 
 # ============ GITHUB API ============
 
@@ -98,10 +172,13 @@ def create_branch(repo, branch_name, base_branch=None):
     sha = ref_result.get('data', {}).get('object', {}).get('sha')
     if not sha:
         return {'error': 'SHA nicht gefunden'}
-    return github('POST', f'/repos/{repo}/git/refs', {
+    created = github('POST', f'/repos/{repo}/git/refs', {
         'ref': f'refs/heads/{branch_name}',
         'sha': sha
     })
+    if 'error' in created and 'Reference already exists' in created.get('details', ''):
+        return {'status': 200, 'data': {'ref': f'refs/heads/{branch_name}', 'object': {'sha': sha}}}
+    return created
 
 def push_file(repo, branch, filepath, content, commit_msg):
     encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
@@ -125,7 +202,10 @@ def push_local_folder(repo, branch, local_path, commit_msg):
         if file.is_file() and file.suffix.lower() in code_extensions:
             rel_path = file.relative_to(local_path).as_posix()
             try:
-                content = file.read_text(encoding='utf-8')
+                content = _read_file_content(file)
+                if content is None:
+                    results.append({'file': rel_path, 'ok': False, 'reason': 'decode_failed'})
+                    continue
                 result = push_file(repo, branch, rel_path, content, commit_msg)
                 results.append({'file': rel_path, 'ok': 'error' not in result})
                 log(f"  Pushed: {rel_path}")
@@ -291,8 +371,8 @@ def send_to_codex(repo, task, local_folder=None):
     log("=" * 50)
     
     # Status-Datei schreiben
-    status_file = r'C:\Users\no\Desktop\codex_bridge_status.json'
-    with open(status_file, 'w') as f:
+    _ensure_parent_dir(CONFIG['status_file'])
+    with open(CONFIG['status_file'], 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, default=str)
     
     return result
@@ -418,6 +498,7 @@ def full_workflow(repo, task, local_folder=None, wait=True):
 # ============ CLI ============
 
 if __name__ == '__main__':
+    _apply_runtime_config()
     load_auth()
     
     if not CONFIG['github_token']:
@@ -435,10 +516,10 @@ if __name__ == '__main__':
             for r in repos.get('data', []):
                 print(f"  - {r['full_name']}")
     
-    elif cmd == 'send' and len(sys.argv) > 3:
+    elif cmd == 'send' and len(sys.argv) > 2:
         repo = sys.argv[2]
-        task = sys.argv[3]
-        folder = sys.argv[4] if len(sys.argv) > 4 else None
+        task = sys.argv[3] if len(sys.argv) > 3 else 'Automatischer Codex Task'
+        folder = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith('--') else None
         result = send_to_codex(repo, task, folder)
         print(json.dumps(result, indent=2, default=str))
     
@@ -459,11 +540,15 @@ if __name__ == '__main__':
         }
         print(json.dumps(display, indent=2, default=str))
     
-    elif cmd == 'workflow' and len(sys.argv) > 3:
+    elif cmd == 'workflow' and len(sys.argv) > 2:
         repo = sys.argv[2]
-        task = sys.argv[3]
-        folder = sys.argv[4] if len(sys.argv) > 4 else None
-        result = full_workflow(repo, task, folder, wait=True)
+        task = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith('--') else 'Automatischer Codex Task'
+        folder = None
+        if len(sys.argv) > 4 and not sys.argv[4].startswith('--'):
+            folder = sys.argv[4]
+
+        wait = _parse_wait_flag(sys.argv[4:])
+        result = full_workflow(repo, task, folder, wait=wait)
         print(json.dumps(result, indent=2, default=str))
     
     elif cmd == 'help':
@@ -477,7 +562,12 @@ Befehle:
   send <repo> "<task>" [ordner]     Code an Codex senden
   status <repo> <branch>            Codex Status pruefen
   result <repo> <branch>            Ergebnisse holen
-  workflow <repo> "<task>" [ordner]  Kompletter Workflow (senden + warten + holen)
+  workflow <repo> "<task>" [ordner] [--no-wait|--wait=sek]
+                                    Kompletter Workflow (senden + warten + holen)
+
+Automatisch:
+  - Token wird aus GITHUB_TOKEN/GH_TOKEN, OpenClaw-Profil oder gh CLI geladen
+  - Logs/Status werden unter ~/.codex_bridge gespeichert
 
 Beispiele:
 
@@ -487,6 +577,8 @@ Beispiele:
   python codex_bridge_v2.py status SellTekk/Jarvis-Scripts codex-1740012345
   python codex_bridge_v2.py result SellTekk/Jarvis-Scripts codex-1740012345
   python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World"
+  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --no-wait
+  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --wait=1200
         """)
     
     else:
