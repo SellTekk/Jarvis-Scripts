@@ -39,11 +39,19 @@ CONFIG = {
     'max_wait': 600,
     'log_file': str(Path.home() / '.codex_bridge' / 'codex_bridge.log'),
     'status_file': str(Path.home() / '.codex_bridge' / 'codex_bridge_status.json'),
+    'inbox_label': 'openclaw-task',
+    'processed_label': 'codex-dispatched',
+    'install_dir': str(Path.home() / '.codex_bridge'),
+    'skill_name': 'codex-bridge-auto',
 }
 
 
 def _ensure_parent_dir(file_path):
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+def _write_text(path, content):
+    _ensure_parent_dir(path)
+    Path(path).write_text(content, encoding='utf-8')
 
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -125,10 +133,14 @@ def create_branch(repo, branch_name, base_branch=None):
     sha = ref_result.get('data', {}).get('object', {}).get('sha')
     if not sha:
         return {'error': 'SHA nicht gefunden'}
-    return github('POST', f'/repos/{repo}/git/refs', {
+    
+    created = github('POST', f'/repos/{repo}/git/refs', {
         'ref': f'refs/heads/{branch_name}',
-        'sha': sha
+        'sha': sha,
     })
+    if 'error' in created and 'Reference already exists' in created.get('details', ''):
+        return {'status': 200, 'data': {'ref': f'refs/heads/{branch_name}', 'object': {'sha': sha}}}
+    return created
 
 def push_file(repo, branch, filepath, content, commit_msg):
     encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
@@ -442,9 +454,173 @@ def full_workflow(repo, task, local_folder=None, wait=True):
         ]
     }
 
+# ============ INBOX FUNKTIONEN ============
+
+def _read_file_content(file_path):
+    """Textinhalt robust einlesen. UTF-8 zuerst, dann Latin-1 Fallback."""
+    try:
+        return file_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            return file_path.read_text(encoding='latin-1')
+        except Exception:
+            return None
+
+def _parse_wait_flag(args):
+    """Steuert workflow-Warteverhalten via --no-wait oder --wait=<sekunden>."""
+    wait = True
+    for arg in args:
+        if arg == '--no-wait':
+            wait = False
+        elif arg.startswith('--wait='):
+            try:
+                CONFIG['max_wait'] = int(arg.split('=', 1)[1])
+            except ValueError:
+                pass
+    return wait
+
+def _apply_runtime_config():
+    """Erlaubt automatische Konfiguration ohne Codeaenderung."""
+    poll = os.environ.get('CODEX_BRIDGE_POLL')
+    max_wait = os.environ.get('CODEX_BRIDGE_MAX_WAIT')
+    default_repo = os.environ.get('CODEX_BRIDGE_DEFAULT_REPO')
+    inbox_label = os.environ.get('CODEX_BRIDGE_INBOX_LABEL')
+    processed_label = os.environ.get('CODEX_BRIDGE_PROCESSED_LABEL')
+    
+    if poll and poll.isdigit():
+        CONFIG['poll_interval'] = int(poll)
+    if max_wait and max_wait.isdigit():
+        CONFIG['max_wait'] = int(max_wait)
+    if default_repo:
+        CONFIG['default_repo'] = default_repo
+    if inbox_label:
+        CONFIG['inbox_label'] = inbox_label
+    if processed_label:
+        CONFIG['processed_label'] = processed_label
+    
+    if not CONFIG.get('github_token'):
+        token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+        if token and 'DEIN_GITHUB' not in token:
+            CONFIG['github_token'] = token
+
+def get_open_inbox_issues(repo, label=None):
+    """Liest offene Aufgaben-Issues aus der GitHub-Inbox."""
+    target_label = label or CONFIG.get('inbox_label', 'openclaw-task')
+    endpoint = f'/repos/{repo}/issues?state=open&labels={target_label}&per_page=20&sort=created&direction=asc'
+    result = github('GET', endpoint)
+    if 'error' in result:
+        return result
+    items = result.get('data', [])
+    issues = [item for item in items if 'pull_request' not in item]
+    return {'status': 200, 'data': issues}
+
+def add_issue_label(repo, issue_number, label):
+    return github('POST', f'/repos/{repo}/issues/{issue_number}/labels', {'labels': [label]})
+
+def comment_issue(repo, issue_number, body):
+    return github('POST', f'/repos/{repo}/issues/{issue_number}/comments', {'body': body})
+
+def process_inbox_issue(repo, issue):
+    """Nimmt ein OpenClaw-Issue und erstellt automatisch eine Codex-Aufgabe."""
+    issue_number = issue.get('number')
+    title = issue.get('title', 'OpenClaw Task')
+    body = issue.get('body') or ''
+    # Remove @codex from body to avoid duplicates
+    body = body.replace('@codex', '').strip()
+    task = f"{title}\n\n{body}".strip()
+    if not task:
+        task = f'Aufgabe aus Issue #{issue_number}'
+    branch = f'codex-issue-{issue_number}-{int(time.time())}'
+    log(f'[INBOX] Verarbeite Issue #{issue_number}: {title}')
+    branch_result = create_branch(repo, branch)
+    if 'error' in branch_result:
+        return {'error': f"Branch konnte nicht erstellt werden: {branch_result.get('error')}"}
+    issue_result = create_codex_issue(repo, branch, task)
+    if 'error' in issue_result:
+        return {'error': f"Codex-Issue konnte nicht erstellt werden: {issue_result.get('error')}"}
+    codex_issue = issue_result.get('data', {})
+    codex_url = codex_issue.get('html_url', 'unbekannt')
+    codex_number = codex_issue.get('number', '?')
+    processed_label = CONFIG.get('processed_label', 'codex-dispatched')
+    add_issue_label(repo, issue_number, processed_label)
+    comment_issue(repo, issue_number, f'✅ Aufgabe wurde an Codex uebergeben.\n\n- Branch: {branch}\n- Codex-Issue: #{codex_number} ({codex_url})\n')
+    return {'status': 'dispatched', 'source_issue': issue_number, 'branch': branch, 'codex_issue_url': codex_url}
+
+def process_inbox(repo, once=True):
+    """Automatische Aufgaben-Inbox: OpenClaw-Issues -> Codex-Issues."""
+    processed = []
+    while True:
+        inbox = get_open_inbox_issues(repo)
+        if 'error' in inbox:
+            return inbox
+        for issue in inbox.get('data', []):
+            labels = [label.get('name') for label in issue.get('labels', [])]
+            processed_label = CONFIG.get('processed_label', 'codex-dispatched')
+            if processed_label in labels:
+                continue
+            result = process_inbox_issue(repo, issue)
+            processed.append(result)
+        if once:
+            break
+        log(f"[INBOX] Warten {CONFIG['poll_interval']}s auf neue Aufgaben...")
+        time.sleep(CONFIG['poll_interval'])
+    return {'status': 'ok', 'processed': processed, 'count': len(processed)}
+
+def install_bridge(repo=None):
+    """Installiert die Bridge fuer den autonomen OpenClaw->GitHub->Codex Workflow."""
+    target_repo = repo or CONFIG['default_repo']
+    install_dir = Path(CONFIG.get('install_dir', str(Path.home() / '.codex_bridge')))
+    install_dir.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve()
+    target_script = install_dir / 'codex_bridge_v2.py'
+    target_script.write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+    env_example = f"""# Codex Bridge Autostart Config
+GITHUB_TOKEN=dein_github_token
+CODEX_BRIDGE_DEFAULT_REPO={target_repo}
+CODEX_BRIDGE_INBOX_LABEL={CONFIG.get('inbox_label', 'openclaw-task')}
+CODEX_BRIDGE_PROCESSED_LABEL={CONFIG.get('processed_label', 'codex-dispatched')}
+"""
+    (install_dir / '.env.example').write_text(env_example, encoding='utf-8')
+    windows_launcher = f"""@echo off
+cd /d {install_dir}
+python codex_bridge_v2.py inbox {target_repo} --daemon
+"""
+    (install_dir / 'run_inbox.bat').write_text(windows_launcher, encoding='utf-8')
+    skill_dir = install_dir / 'skill'
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = f"""---
+name: codex-bridge-auto
+description: Automatisiert OpenClaw->GitHub->Codex Aufgabenuebergabe.
+---
+
+# Codex Bridge Auto Skill
+
+## Wann nutzen
+- Wenn OpenClaw-Aufgaben per GitHub-Issue automatisch an Codex gehen sollen.
+
+## Workflow
+1. GitHub-Issue mit Label "openclaw-task" anlegen
+2. Die Bridge erstellt Branch + Codex-Issue automatisch
+
+## Starten
+python "{install_dir / 'codex_bridge_v2.py'}" inbox {target_repo} --daemon
+"""
+    (skill_dir / 'SKILL.md').write_text(skill_md, encoding='utf-8')
+    return {
+        'status': 'installed',
+        'install_dir': str(install_dir),
+        'repo': target_repo,
+        'next_steps': [
+            f'1) Token setzen: GITHUB_TOKEN=...',
+            f'2) Starten: python "{install_dir / "codex_bridge_v2.py"}" inbox {target_repo} --daemon',
+            f'3) Aufgaben per GitHub-Issue mit Label "openclaw-task" anlegen'
+        ]
+    }
+
 # ============ CLI ============
 
 if __name__ == '__main__':
+    _apply_runtime_config()
     load_auth()
     
     if not CONFIG['github_token']:
@@ -486,11 +662,25 @@ if __name__ == '__main__':
         }
         print(json.dumps(display, indent=2, default=str))
     
-    elif cmd == 'workflow' and len(sys.argv) > 3:
+    elif cmd == 'workflow' and len(sys.argv) > 2:
         repo = sys.argv[2]
-        task = sys.argv[3]
-        folder = sys.argv[4] if len(sys.argv) > 4 else None
-        result = full_workflow(repo, task, folder, wait=True)
+        task = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith('--') else 'Automatischer Codex Task'
+        folder = None
+        if len(sys.argv) > 4 and not sys.argv[4].startswith('--'):
+            folder = sys.argv[4]
+        wait = _parse_wait_flag(sys.argv[4:])
+        result = full_workflow(repo, task, folder, wait=wait)
+        print(json.dumps(result, indent=2, default=str))
+    
+    elif cmd == 'install' and len(sys.argv) > 2:
+        repo = sys.argv[2] if not sys.argv[2].startswith('--') else CONFIG['default_repo']
+        result = install_bridge(repo)
+        print(json.dumps(result, indent=2, default=str))
+    
+    elif cmd == 'inbox' and len(sys.argv) > 1:
+        repo = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('--') else CONFIG['default_repo']
+        daemon_mode = '--daemon' in sys.argv
+        result = process_inbox(repo, once=not daemon_mode)
         print(json.dumps(result, indent=2, default=str))
     
     elif cmd == 'help':
@@ -500,20 +690,21 @@ Codex Bridge v2 - OpenClaw -> GitHub -> Codex -> GitHub -> OpenClaw
 
 Befehle:
 
-  test                              GitHub Verbindung testen
-  send <repo> "<task>" [ordner]     Code an Codex senden
-  status <repo> <branch>            Codex Status pruefen
-  result <repo> <branch>            Ergebnisse holen
-  workflow <repo> "<task>" [ordner]  Kompletter Workflow (senden + warten + holen)
+  install <repo>                   Bridge installieren (Autobetrieb vorbereiten)
+  inbox <repo> [--daemon]          Inbox-Daemon starten
+  test                             GitHub Verbindung testen
+  send <repo> "<task>" [ordner]    Code an Codex senden
+  status <repo> <branch>           Codex Status pruefen
+  result <repo> <branch>           Ergebnisse holen
+  workflow <repo> "<task>" [ordner] [--no-wait|--wait=sek] Komplett
 
 Beispiele:
 
+  python codex_bridge_v2.py install SellTekk/Jarvis-Scripts
+  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts --daemon
   python codex_bridge_v2.py test
-  python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Todo-Liste programmieren"
-  python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Bug fixen" C:\\MeinProjekt
-  python codex_bridge_v2.py status SellTekk/Jarvis-Scripts codex-1740012345
-  python codex_bridge_v2.py result SellTekk/Jarvis-Scripts codex-1740012345
-  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World"
+  python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Todo-Liste"
+  python codex_bridge_v2.py status SellTekk/Jarvis-Scripts codex-1234567890
         """)
     
     else:
