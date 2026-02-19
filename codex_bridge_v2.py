@@ -24,7 +24,10 @@ import json
 import base64
 import time
 import subprocess
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None
 from pathlib import Path
 from datetime import datetime
 
@@ -41,11 +44,16 @@ CONFIG = {
     'status_file': str(Path.home() / '.codex_bridge' / 'codex_bridge_status.json'),
     'inbox_label': 'openclaw-task',
     'processed_label': 'codex-dispatched',
+    'install_dir': str(Path.home() / '.codex_bridge'),
 }
 
 
 def _ensure_parent_dir(file_path):
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+def _write_text(path, content):
+    _ensure_parent_dir(path)
+    Path(path).write_text(content, encoding='utf-8')
 
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -149,6 +157,8 @@ def _apply_runtime_config():
 # ============ GITHUB API ============
 
 def github(method, endpoint, data=None):
+    if requests is None:
+        return {'error': 'Python-Modul "requests" fehlt. Installiere mit: pip install requests'}
     if not CONFIG['github_token']:
         return {'error': 'GitHub Token fehlt'}
     url = f'https://api.github.com{endpoint}'
@@ -329,6 +339,41 @@ def process_inbox(repo, once=True):
         time.sleep(CONFIG['poll_interval'])
 
     return {'status': 'ok', 'processed': processed, 'count': len(processed)}
+
+def install_bridge(repo=None):
+    """Installiert die Bridge fuer den autonomen OpenClaw->GitHub->Codex Workflow."""
+    target_repo = repo or CONFIG['default_repo']
+    install_dir = Path(CONFIG['install_dir'])
+    install_dir.mkdir(parents=True, exist_ok=True)
+
+    source = Path(__file__).resolve()
+    target_script = install_dir / 'codex_bridge_v2.py'
+    target_script.write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    env_example = f"""# Codex Bridge Autostart Config\nGITHUB_TOKEN=dein_github_token\nCODEX_BRIDGE_DEFAULT_REPO={target_repo}\nCODEX_BRIDGE_INBOX_LABEL={CONFIG['inbox_label']}\nCODEX_BRIDGE_PROCESSED_LABEL={CONFIG['processed_label']}\nCODEX_BRIDGE_POLL={CONFIG['poll_interval']}\n"""
+    _write_text(str(install_dir / '.env.example'), env_example)
+
+    linux_launcher = f"""#!/usr/bin/env bash\nset -euo pipefail\ncd \"{install_dir}\"\npython3 codex_bridge_v2.py inbox {target_repo} --daemon\n"""
+    _write_text(str(install_dir / 'run_inbox.sh'), linux_launcher)
+    os.chmod(install_dir / 'run_inbox.sh', 0o755)
+
+    windows_launcher = f"""@echo off\ncd /d {install_dir}\npython codex_bridge_v2.py inbox {target_repo} --daemon\n"""
+    _write_text(str(install_dir / 'run_inbox.bat'), windows_launcher)
+
+    service = f"""[Unit]\nDescription=Codex Bridge Inbox Worker\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={install_dir}\nExecStart=/usr/bin/python3 {install_dir / 'codex_bridge_v2.py'} inbox {target_repo} --daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"""
+    _write_text(str(install_dir / 'codex-bridge.service.example'), service)
+
+    return {
+        'status': 'installed',
+        'install_dir': str(install_dir),
+        'script': str(target_script),
+        'repo': target_repo,
+        'next_steps': [
+            f'1) Token setzen: export GITHUB_TOKEN=... (oder in {install_dir}/.env)',
+            f'2) Starten: {install_dir}/run_inbox.sh',
+            f'3) Aufgaben per GitHub-Issue mit Label "{CONFIG["inbox_label"]}" anlegen'
+        ]
+    }
 
 def check_for_changes(repo, branch, base_branch=None):
     """Prueft ob Codex Aenderungen gemacht hat"""
@@ -593,14 +638,48 @@ def full_workflow(repo, task, local_folder=None, wait=True):
 
 if __name__ == '__main__':
     _apply_runtime_config()
-    load_auth()
     
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'help'
+
+    if cmd == 'install':
+        repo = sys.argv[2] if len(sys.argv) > 2 else CONFIG['default_repo']
+        print(json.dumps(install_bridge(repo), indent=2, default=str))
+        sys.exit(0)
+
+    if cmd == 'help':
+        print("""
+Codex Bridge v2 - OpenClaw -> GitHub -> Codex -> GitHub -> OpenClaw
+====================================================================
+
+Befehle:
+
+  install [repo]                    Bridge lokal installieren (Autobetrieb vorbereiten)
+  test                              GitHub Verbindung testen
+  send <repo> "<task>" [ordner]     Code an Codex senden
+  status <repo> <branch>            Codex Status pruefen
+  result <repo> <branch>            Ergebnisse holen
+  inbox [repo] [--daemon]           OpenClaw-Issues automatisch an Codex uebergeben
+  workflow <repo> "<task>" [ordner] [--no-wait|--wait=sek]
+                                    Kompletter Workflow (senden + warten + holen)
+
+Automatisch:
+  - Token wird aus GITHUB_TOKEN/GH_TOKEN, OpenClaw-Profil oder gh CLI geladen
+  - Logs/Status werden unter ~/.codex_bridge gespeichert
+  - Inbox-Modus: Label `openclaw-task` => automatische Uebergabe an Codex
+
+Beispiele:
+
+  python codex_bridge_v2.py install SellTekk/Jarvis-Scripts
+  python codex_bridge_v2.py test
+  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts --daemon
+        """)
+        sys.exit(0)
+
+    load_auth()
     if not CONFIG['github_token']:
         print("[ERROR] GitHub Token nicht gefunden!")
         sys.exit(1)
-    
-    cmd = sys.argv[1] if len(sys.argv) > 1 else 'help'
-    
+
     if cmd == 'test':
         repos = github('GET', '/user/repos?per_page=5')
         if 'error' in repos:
@@ -650,40 +729,6 @@ if __name__ == '__main__':
         wait = _parse_wait_flag(sys.argv[4:])
         result = full_workflow(repo, task, folder, wait=wait)
         print(json.dumps(result, indent=2, default=str))
-    
-    elif cmd == 'help':
-        print("""
-Codex Bridge v2 - OpenClaw -> GitHub -> Codex -> GitHub -> OpenClaw
-====================================================================
-
-Befehle:
-
-  test                              GitHub Verbindung testen
-  send <repo> "<task>" [ordner]     Code an Codex senden
-  status <repo> <branch>            Codex Status pruefen
-  result <repo> <branch>            Ergebnisse holen
-  inbox [repo] [--daemon]           OpenClaw-Issues automatisch an Codex uebergeben
-  workflow <repo> "<task>" [ordner] [--no-wait|--wait=sek]
-                                    Kompletter Workflow (senden + warten + holen)
-
-Automatisch:
-  - Token wird aus GITHUB_TOKEN/GH_TOKEN, OpenClaw-Profil oder gh CLI geladen
-  - Logs/Status werden unter ~/.codex_bridge gespeichert
-  - Inbox-Modus: Label `openclaw-task` => automatische Uebergabe an Codex
-
-Beispiele:
-
-  python codex_bridge_v2.py test
-  python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Todo-Liste programmieren"
-  python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Bug fixen" C:\\MeinProjekt
-  python codex_bridge_v2.py status SellTekk/Jarvis-Scripts codex-1740012345
-  python codex_bridge_v2.py result SellTekk/Jarvis-Scripts codex-1740012345
-  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts
-  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts --daemon
-  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World"
-  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --no-wait
-  python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --wait=1200
-        """)
     
     else:
         print("[ERROR] Unbekannter Befehl. Nutze: python codex_bridge_v2.py help")
