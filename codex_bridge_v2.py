@@ -39,6 +39,8 @@ CONFIG = {
     'max_wait': 600,
     'log_file': str(Path.home() / '.codex_bridge' / 'codex_bridge.log'),
     'status_file': str(Path.home() / '.codex_bridge' / 'codex_bridge_status.json'),
+    'inbox_label': 'openclaw-task',
+    'processed_label': 'codex-dispatched',
 }
 
 
@@ -124,6 +126,8 @@ def _apply_runtime_config():
     poll = os.environ.get('CODEX_BRIDGE_POLL')
     max_wait = os.environ.get('CODEX_BRIDGE_MAX_WAIT')
     default_repo = os.environ.get('CODEX_BRIDGE_DEFAULT_REPO')
+    inbox_label = os.environ.get('CODEX_BRIDGE_INBOX_LABEL')
+    processed_label = os.environ.get('CODEX_BRIDGE_PROCESSED_LABEL')
 
     if poll and poll.isdigit():
         CONFIG['poll_interval'] = int(poll)
@@ -131,6 +135,10 @@ def _apply_runtime_config():
         CONFIG['max_wait'] = int(max_wait)
     if default_repo:
         CONFIG['default_repo'] = default_repo
+    if inbox_label:
+        CONFIG['inbox_label'] = inbox_label
+    if processed_label:
+        CONFIG['processed_label'] = processed_label
 
     if not CONFIG.get('github_token'):
         token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
@@ -235,6 +243,92 @@ def create_codex_issue(repo, branch, task):
         'labels': ['codex', 'automation']
     })
     return result
+
+def get_open_inbox_issues(repo, label=None):
+    """Liest offene Aufgaben-Issues aus der GitHub-Inbox."""
+    target_label = label or CONFIG['inbox_label']
+    endpoint = f'/repos/{repo}/issues?state=open&labels={target_label}&per_page=20&sort=created&direction=asc'
+    result = github('GET', endpoint)
+    if 'error' in result:
+        return result
+
+    items = result.get('data', [])
+    issues = [item for item in items if 'pull_request' not in item]
+    return {'status': 200, 'data': issues}
+
+def add_issue_label(repo, issue_number, label):
+    return github('POST', f'/repos/{repo}/issues/{issue_number}/labels', {'labels': [label]})
+
+def comment_issue(repo, issue_number, body):
+    return github('POST', f'/repos/{repo}/issues/{issue_number}/comments', {'body': body})
+
+def process_inbox_issue(repo, issue):
+    """Nimmt ein OpenClaw-Issue und erstellt automatisch eine Codex-Aufgabe."""
+    issue_number = issue.get('number')
+    title = issue.get('title', 'OpenClaw Task')
+    body = issue.get('body') or ''
+
+    task = f"{title}\n\n{body}".strip()
+    if not task:
+        task = f'Aufgabe aus Issue #{issue_number}'
+
+    branch = f'codex-issue-{issue_number}-{int(time.time())}'
+    log(f'[INBOX] Verarbeite Issue #{issue_number}: {title}')
+
+    branch_result = create_branch(repo, branch)
+    if 'error' in branch_result:
+        return {'error': f"Branch konnte nicht erstellt werden: {branch_result.get('error')}"}
+
+    issue_result = create_codex_issue(repo, branch, task)
+    if 'error' in issue_result:
+        return {'error': f"Codex-Issue konnte nicht erstellt werden: {issue_result.get('error')}"}
+
+    codex_issue = issue_result.get('data', {})
+    codex_url = codex_issue.get('html_url', 'unbekannt')
+    codex_number = codex_issue.get('number', '?')
+
+    add_issue_label(repo, issue_number, CONFIG['processed_label'])
+    comment_issue(
+        repo,
+        issue_number,
+        (
+            '✅ Aufgabe wurde an Codex uebergeben.\n\n'
+            f'- Branch: `{branch}`\n'
+            f'- Codex-Issue: #{codex_number} ({codex_url})\n'
+        )
+    )
+
+    return {
+        'status': 'dispatched',
+        'source_issue': issue_number,
+        'branch': branch,
+        'codex_issue_url': codex_url,
+    }
+
+def process_inbox(repo, once=True):
+    """Automatische Aufgaben-Inbox: OpenClaw-Issues -> Codex-Issues."""
+    processed = []
+
+    while True:
+        inbox = get_open_inbox_issues(repo)
+        if 'error' in inbox:
+            return inbox
+
+        for issue in inbox.get('data', []):
+            labels = [label.get('name') for label in issue.get('labels', [])]
+            if CONFIG['processed_label'] in labels:
+                continue
+
+            result = process_inbox_issue(repo, issue)
+            processed.append(result)
+
+        if once:
+            break
+
+        log(f"[INBOX] Warten {CONFIG['poll_interval']}s auf neue Aufgaben...")
+        time.sleep(CONFIG['poll_interval'])
+
+    return {'status': 'ok', 'processed': processed, 'count': len(processed)}
 
 def check_for_changes(repo, branch, base_branch=None):
     """Prueft ob Codex Aenderungen gemacht hat"""
@@ -539,6 +633,12 @@ if __name__ == '__main__':
             'changes': result.get('changes', {})
         }
         print(json.dumps(display, indent=2, default=str))
+
+    elif cmd == 'inbox':
+        repo = sys.argv[2] if len(sys.argv) > 2 else CONFIG['default_repo']
+        daemon_mode = '--daemon' in sys.argv[3:]
+        result = process_inbox(repo, once=not daemon_mode)
+        print(json.dumps(result, indent=2, default=str))
     
     elif cmd == 'workflow' and len(sys.argv) > 2:
         repo = sys.argv[2]
@@ -562,12 +662,14 @@ Befehle:
   send <repo> "<task>" [ordner]     Code an Codex senden
   status <repo> <branch>            Codex Status pruefen
   result <repo> <branch>            Ergebnisse holen
+  inbox [repo] [--daemon]           OpenClaw-Issues automatisch an Codex uebergeben
   workflow <repo> "<task>" [ordner] [--no-wait|--wait=sek]
                                     Kompletter Workflow (senden + warten + holen)
 
 Automatisch:
   - Token wird aus GITHUB_TOKEN/GH_TOKEN, OpenClaw-Profil oder gh CLI geladen
   - Logs/Status werden unter ~/.codex_bridge gespeichert
+  - Inbox-Modus: Label `openclaw-task` => automatische Uebergabe an Codex
 
 Beispiele:
 
@@ -576,6 +678,8 @@ Beispiele:
   python codex_bridge_v2.py send SellTekk/Jarvis-Scripts "Bug fixen" C:\\MeinProjekt
   python codex_bridge_v2.py status SellTekk/Jarvis-Scripts codex-1740012345
   python codex_bridge_v2.py result SellTekk/Jarvis-Scripts codex-1740012345
+  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts
+  python codex_bridge_v2.py inbox SellTekk/Jarvis-Scripts --daemon
   python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World"
   python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --no-wait
   python codex_bridge_v2.py workflow SellTekk/Jarvis-Scripts "Hello World" --wait=1200
