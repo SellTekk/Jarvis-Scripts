@@ -1,0 +1,9 @@
+{
+  "name": "codex-bridge-main",
+  "version": "1.0.0",
+  "description": "Closed-loop bridge that routes everything through main: dispatch tasks to Codex, merge PRs to main, pull locally.",
+  "entrypoints": {
+    "installer": "scripts/INSTALL (Doppelklick).cmd",
+    "bridge": "scripts/bridge_main.py"
+  }
+}
