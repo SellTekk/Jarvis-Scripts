@@ -1,0 +1,7 @@
+{
+  "name": "model-switch",
+  "description": "Wechsle zwischen free und premium Modellen",
+  "version": "1.0.0",
+  "author": "Jarvis",
+  "triggers": ["/free", "/premium", "/model"]
+}

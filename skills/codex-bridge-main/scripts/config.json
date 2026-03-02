@@ -1,0 +1,10 @@
+{
+  "repo": "SellTekk/Jarvis-Scripts",
+  "base": "main",
+  "localRepo": "%USERPROFILE%\\.openclaw\\repos\\Jarvis-Scripts",
+  "openclawSkillsDir": "%USERPROFILE%\\.openclaw\\skills",
+  "repoSkillPath": "openclaw_skills\\codex-bridge-auto",
+  "linkName": "codex-bridge-auto",
+  "taskName": "OpenClaw Codex Sync",
+  "minutes": 2
+}
