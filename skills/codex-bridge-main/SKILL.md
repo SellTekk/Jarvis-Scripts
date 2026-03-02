@@ -37,9 +37,31 @@ Das macht:
 py -3 scripts\bridge_main.py dispatch --repo SellTekk/Jarvis-Scripts --task "Baue Taschenrechner Projekt (Python) im Ordner codex_tasks/calculator" --local "%USERPROFILE%\.openclaw\repos\Jarvis-Scripts" --base main --route codex_tasks/calculator
 ```
 
+Tipp: `dispatch` legt den Issue + PR jetzt **defensiv** an (Labels sind best-effort) und pingt @codex sowohl im PR als auch im Issue.
+
 2) Sync (PR mergen + pull main):
 ```
 py -3 scripts\bridge_main.py sync --repo SellTekk/Jarvis-Scripts --local "%USERPROFILE%\.openclaw\repos\Jarvis-Scripts" --base main --merge --pull
+```
+
+Seed-only PRs überspringen:
+```
+py -3 scripts\bridge_main.py sync --repo SellTekk/Jarvis-Scripts --base main --merge --min-commits 2
+```
+
+@codex nochmal anstupsen:
+```
+py -3 scripts\bridge_main.py sync --repo SellTekk/Jarvis-Scripts --base main --nudge
+```
+
+Wenn Codex Cloud **nicht pushen kann**, aber ein Patch als Kommentar postet:
+```
+py -3 scripts\bridge_main.py sync --repo SellTekk/Jarvis-Scripts --local "%USERPROFILE%\.openclaw\repos\Jarvis-Scripts" --base main --apply-patches
+```
+
+Status-Übersicht:
+```
+py -3 scripts\bridge_main.py status --repo SellTekk/Jarvis-Scripts --base main
 ```
 
 Logs:
