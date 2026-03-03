@@ -16,17 +16,33 @@ import random
 import os
 import subprocess
 import re
+import signal
+import sys
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.options import Options
+
+# === ROBUSTNESS KONFIGURATION ===
+MAX_PRODUCTS_BEFORE_BROWSER_RESTART = 30  # Browser alle 30 Produkte neu starten
+CHECKPOINT_FILE = "F:/crawlerv5/crawler_checkpoint.txt"
+SHUTDOWN_REQUESTED = False
+
+# Signal Handler für Graceful Shutdown
+def signal_handler(signum, frame):
+    global SHUTDOWN_REQUESTED
+    print("\n⚠️ Signal erhalten - speichere Fortschritt und beende...")
+    SHUTDOWN_REQUESTED = True
+    
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # === KONFIGURATION ===
 # Wähle: "handy" oder "tablet"
 PRODUKT_TYP = "handy"
 
 if PRODUKT_TYP == "handy":
-    INPUT_FILE = "F:/crawlerv5/RELEASE_handy_TB.xlsx"  # TB-Produkte!
+    INPUT_FILE = "F:/crawlerv5/RELEASE_handy.xlsx"  # ALLE Produkte!
     OUTPUT_FILE = "F:/crawlerv5/RELEASE_handy_ergebnis.xlsx"
 elif PRODUKT_TYP == "tablet":
     INPUT_FILE = "F:/crawlerv5/RELEASE_tablet.xlsx"
@@ -521,16 +537,34 @@ def main():
     # Alle 837 Zeilen verarbeiten
     # df = df.head(10)  # Debug: nur erste 10
     
-    options = Options()
-    options.add_argument("--start-maximized")
+    # Browser erstellen (wird bei Bedarf neu gestartet)
+    def create_browser():
+        options = Options()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        
+        # Proxy verwenden
+        if PROXY:
+            options.add_argument(f"--proxy-server={PROXY}")
+        
+        driver = webdriver.Chrome(options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return driver, WebDriverWait(driver, 15)
     
-    # Proxy verwenden
-    if PROXY:
-        options.add_argument(f"--proxy-server={PROXY}")
-        print(f"[*] Proxy: {PROXY}")
+    driver, wait = create_browser()
+    print(f"[*] Browser gestartet")
     
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 15)
+    # Checkpoint laden
+    start_index = 0
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r') as f:
+                start_index = int(f.read().strip())
+            print(f"[*] Checkpoint gefunden - starte bei Index {start_index}")
+        except:
+            pass
     
     # Bestehende Ergebnisse laden (falls vorhanden)
     all_results = []
@@ -556,7 +590,17 @@ def main():
     
     products_processed = 0
     
-    for idx, row in df.iterrows():
+    # Bei Index starten (für Resume nach Crash)
+    df_reset = df.reset_index(drop=True)
+    if start_index > 0:
+        print(f"[*] Überspringe erste {start_index} Produkte...")
+    
+    for df_idx, row in df_reset.iterrows():
+        # Checkpoint-basiert überspringen
+        if df_idx < start_index:
+            continue
+            
+        idx = df_idx
         sku = row['sku']
         
         # Überspringe bereits verarbeitete
@@ -564,7 +608,10 @@ def main():
             continue
         products_processed += 1
         
-        # Kein automatischer Browser-Neustart - nur bei Fehlern (Retry)
+        # Graceful Shutdown Check am Anfang jedes Produkts
+        if SHUTDOWN_REQUESTED:
+            print(f"\n⚠️ Shutdown bei Produkt {df_idx+1} - speichere Fortschritt...")
+            break
         
         name = row['Name']
         url_scrape = str(row['url scrape'])
@@ -667,6 +714,23 @@ def main():
             result_df = pd.DataFrame(all_results)
             result_df.to_excel(OUTPUT_FILE, index=False)
         
+        # Checkpoint speichern
+        with open(CHECKPOINT_FILE, 'w') as f:
+            f.write(str(idx))
+        
+        # Browser-Neustart alle N Produkte (Memory Leak verhindern)
+        products_processed += 1
+        if products_processed >= MAX_PRODUCTS_BEFORE_BROWSER_RESTART:
+            print(f"\n🔄 Browser-Neustart nach {products_processed} Produkten (Memory Leak verhindern)...")
+            driver.quit()
+            driver, wait = create_browser()
+            products_processed = 0
+        
+        # Graceful Shutdown prüfen
+        if SHUTDOWN_REQUESTED:
+            print("\n⚠️ Shutdown Signal erkannt - speichere und beende...")
+            break
+        
         time.sleep(random.uniform(5, 10))
     
     # Zweiter Durchgang: Fehlgeschlagene Produkte nochmal versuchen
@@ -739,7 +803,11 @@ def main():
         result_df.to_excel(OUTPUT_FILE, index=False)
         print(f"\nFertig! {len(all_results)} Ergebnisse: {OUTPUT_FILE}")
     
+    # Cleanup
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)  # Erfolgreich beendet - Checkpoint löschen
     driver.quit()
+    print("[*] Browser geschlossen. Auf Wiedersehen!")
 
 
 if __name__ == "__main__":
