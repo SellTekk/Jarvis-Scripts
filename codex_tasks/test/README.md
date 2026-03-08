@@ -1,5 +1,8 @@
-# Codex Task Seed
+# Codex Task
 
 Task:
 
-Aendere test_file.py - aendere print Bridge Test zu Codex Works
+Erweitere parse_data()
+
+File:
+crawler_handy.py
